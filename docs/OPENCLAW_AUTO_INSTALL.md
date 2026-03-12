@@ -1,47 +1,40 @@
-# 给其他 OpenClaw 自动安装用的文档：telegram-sticker-search 1.0.0
+# OpenClaw Auto-Install Guide: telegram-sticker-search 1.0.0
 
-这份文档是写给 **另一个 OpenClaw 实例**、或者给会自动操作 OpenClaw 的 agent 用的。
+Use this document when another OpenClaw deployment, or an agent managing that deployment, needs to install this plugin automatically.
 
-目标：
+## Plugin identity
 
-- 安装插件
-- 写入配置
-- 重启 Gateway
-- 验证工具可用
+- npm package: `telegram-sticker-search`
+- plugin id: `telegram-sticker-search`
+- config path: `plugins.entries.telegram-sticker-search`
 
-## 插件信息
+## Prerequisites
 
-- npm 包名：`telegram-sticker-search`
-- 插件 ID：`telegram-sticker-search`
-- 配置路径：`plugins.entries.telegram-sticker-search`
+The target OpenClaw instance should already have:
 
-## 前提条件
-
-目标 OpenClaw 环境里应该已经有：
-
-- Telegram 配置
-- Telegram bot token
-- Gemini API key
+- Telegram configured
+- a valid Telegram bot token
+- a Gemini API key
 - Node.js 18+
-- `ffmpeg`（推荐）
+- `ffmpeg` recommended for animated or video sticker previews
 
-## 安装方式
+## Install options
 
-### 方式 A：npm 安装
+### Option A: install from npm
 
 ```bash
 openclaw plugins install telegram-sticker-search
 ```
 
-### 方式 B：用 release 里的 tgz 安装
+### Option B: install from a release tarball
 
-先下载 release 里的压缩包，再执行：
+Download the release asset first, then run:
 
 ```bash
 openclaw plugins install ./telegram-sticker-search-1.0.0.tgz
 ```
 
-### 方式 C：源码安装
+### Option C: install from source
 
 ```bash
 git clone https://github.com/MashiroCodfish/telegram-sticker-search.git
@@ -50,9 +43,9 @@ npm install
 openclaw plugins install .
 ```
 
-## 配置模板
+## Config template
 
-把下面这段合并到目标 OpenClaw 配置里：
+Merge this into the target OpenClaw config:
 
 ```json5
 {
@@ -72,75 +65,70 @@ openclaw plugins install .
 }
 ```
 
-如果你想让目标实例完全手动管理合集，就把：
+Set `autoCollect` to `false` if the target deployment should remain fully manual.
 
-```json5
-"autoCollect": false
-```
+## Restart
 
-## 重启
-
-安装和配置完成后：
+After install and config changes:
 
 ```bash
 openclaw gateway restart
 ```
 
-## 安装完成后怎么验证
+## Verification
 
-### 1. 确认插件存在
+### 1. Confirm the plugin is installed
 
 ```bash
 openclaw plugins list
 ```
 
-### 2. 确认插件详情正常
+### 2. Confirm the plugin info looks correct
 
 ```bash
 openclaw plugins info telegram-sticker-search
 ```
 
-### 3. 确认工具可用
+### 3. Confirm the tools exist
 
-目标实例应该能提供这 3 个工具：
+The target deployment should expose:
 
 - `sync_sticker_set_by_name`
 - `get_sticker_stats`
 - `search_sticker_by_emotion`
 
-## 推荐自动验收流程
+## Recommended smoke test
 
-1. 同步一个已知的表情包合集
-2. 等待索引完成
-3. 调用 `get_sticker_stats`
-4. 调用 `search_sticker_by_emotion`
-5. 验证是否返回 `sticker_id`
+1. Sync one known sticker set
+2. Wait for indexing to finish
+3. Run `get_sticker_stats`
+4. Run `search_sticker_by_emotion`
+5. Confirm a `sticker_id` is returned
 
-### 示例：同步合集
+### Example: sync a sticker set
 
 ```text
 sync_sticker_set_by_name({"setNameOrUrl":"https://t.me/addstickers/<SET_NAME>"})
 ```
 
-### 示例：查询统计
+### Example: stats
 
 ```text
 get_sticker_stats({})
 ```
 
-### 示例：搜索
+### Example: search
 
 ```text
 search_sticker_by_emotion({"query":"开心 笑着 跑"})
 ```
 
-## 给 agent 的一句话总结
+## Summary
 
-这是一个：
+This plugin provides:
 
-- 用 Gemini Embedding 2 建表情包向量
-- 本地 SQLite 存储
-- 本地内存搜索
-- 支持手动同步和可选自动收集
-
-的 OpenClaw 插件。
+- Gemini Embedding 2 for sticker vectors
+- local SQLite storage
+- local in-memory search
+- manual sticker-set sync
+- optional automatic collection with `autoCollect`

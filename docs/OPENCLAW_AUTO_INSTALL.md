@@ -1,51 +1,49 @@
-# OpenClaw Auto Install Guide: telegram-stickers-brain 1.0.0
+# 给其他 OpenClaw 自动安装用的文档：telegram-stickers-brain 1.0.0
 
-Use this document when an OpenClaw operator or another OpenClaw agent needs to install the plugin with minimal manual interpretation.
+这份文档是写给 **另一个 OpenClaw 实例**、或者给会自动操作 OpenClaw 的 agent 用的。
 
-## Scope
+目标：
 
-This guide covers a clean automated install flow for another OpenClaw deployment:
+- 安装插件
+- 写入配置
+- 重启 Gateway
+- 验证工具可用
 
-1. install the plugin
-2. configure embedding settings
-3. restart the Gateway
-4. verify tool availability
+## 插件信息
 
-## Plugin identity
+- npm 包名：`@roitium/telegram-stickers-brain`
+- 插件 ID：`telegram-stickers-brain`
+- 配置路径：`plugins.entries.telegram-stickers-brain`
 
-- npm package: `@roitium/telegram-stickers-brain`
-- plugin id: `telegram-stickers-brain`
-- config path: `plugins.entries.telegram-stickers-brain`
+## 前提条件
 
-## Preconditions
+目标 OpenClaw 环境里应该已经有：
 
-The target OpenClaw instance should already have:
-
-- Telegram configured and working
-- a valid Telegram bot token
-- a Gemini API key for embeddings
+- Telegram 配置
+- Telegram bot token
+- Gemini API key
 - Node.js 18+
-- `ffmpeg` available for animated or video sticker preview extraction
+- `ffmpeg`（推荐）
 
-## Automated install flow
+## 安装方式
 
-### Option A: install from npm (after npm publish)
+### 方式 A：npm 安装
 
 ```bash
 openclaw plugins install @roitium/telegram-stickers-brain
 ```
 
-Use this path only after the package has been published to npm.
+> 这个方式要在 npm 已发布后再用。
 
-### Option B: install from a local tarball
+### 方式 B：用 release 里的 tgz 安装
 
-Download the release asset first, then install it:
+先下载 release 里的压缩包，再执行：
 
 ```bash
 openclaw plugins install ./roitium-telegram-stickers-brain-1.0.0.tgz
 ```
 
-### Option C: install from a source checkout
+### 方式 C：源码安装
 
 ```bash
 git clone https://github.com/MashiroCodfish/telegram-stickers-brain.git
@@ -54,9 +52,9 @@ npm install
 openclaw plugins install .
 ```
 
-## Config patch template
+## 配置模板
 
-Set or merge this under the target OpenClaw config:
+把下面这段合并到目标 OpenClaw 配置里：
 
 ```json5
 {
@@ -76,69 +74,75 @@ Set or merge this under the target OpenClaw config:
 }
 ```
 
-Set `autoCollect` to `false` if the target deployment should remain fully manual.
+如果你想让目标实例完全手动管理合集，就把：
 
-## Restart
+```json5
+"autoCollect": false
+```
 
-After install and config changes:
+## 重启
+
+安装和配置完成后：
 
 ```bash
 openclaw gateway restart
 ```
 
-## Post-install verification
+## 安装完成后怎么验证
 
-### Check plugin presence
+### 1. 确认插件存在
 
 ```bash
 openclaw plugins list
 ```
 
-### Check plugin details
+### 2. 确认插件详情正常
 
 ```bash
 openclaw plugins info telegram-stickers-brain
 ```
 
-### Expected tools
+### 3. 确认工具可用
 
-The deployment should expose:
+目标实例应该能提供这 3 个工具：
 
 - `sync_sticker_set_by_name`
 - `get_sticker_stats`
 - `search_sticker_by_emotion`
 
-## Recommended smoke test
+## 推荐自动验收流程
 
-1. Sync one known sticker set
-2. Wait for indexing to finish
-3. Run `get_sticker_stats`
-4. Run `search_sticker_by_emotion`
-5. Send the returned `sticker_id`
+1. 同步一个已知的表情包合集
+2. 等待索引完成
+3. 调用 `get_sticker_stats`
+4. 调用 `search_sticker_by_emotion`
+5. 验证是否返回 `sticker_id`
 
-## Example smoke test inputs
-
-### Manual sync
+### 示例：同步合集
 
 ```text
 sync_sticker_set_by_name({"setNameOrUrl":"https://t.me/addstickers/<SET_NAME>"})
 ```
 
-### Stats
+### 示例：查询统计
 
 ```text
 get_sticker_stats({})
 ```
 
-### Search
+### 示例：搜索
 
 ```text
 search_sticker_by_emotion({"query":"开心 笑着 跑"})
 ```
 
-## Notes for agents and operators
+## 给 agent 的一句话总结
 
-- The indexing/search core is unchanged whether `autoCollect` is enabled or disabled
-- Vectors are stored locally in SQLite
-- Search runs locally in memory using cosine similarity
-- The plugin returns Telegram `sticker_id` values for downstream sending
+这是一个：
+
+- 用 Gemini Embedding 2 建表情包向量
+- 本地 SQLite 存储
+- 本地内存搜索
+- 支持手动同步和可选自动收集
+
+的 OpenClaw 插件。

@@ -1,29 +1,49 @@
 # telegram-stickers-brain
 
-`telegram-stickers-brain` is an OpenClaw plugin for semantic Telegram sticker search.
+一个给 **OpenClaw** 用的 Telegram 表情包语义搜索插件。
 
-It syncs Telegram sticker sets, builds embeddings with **Gemini Embedding 2**, stores vectors in **local SQLite**, and searches them in memory with cosine similarity.
+它做的事情很简单：
 
-## Features
+1. 同步 Telegram 表情包合集
+2. 用 **Gemini Embedding 2** 给表情包建立向量
+3. 把向量存到本地 **SQLite**
+4. 搜索时在本地内存里做相似度匹配
+5. 返回最合适的 `sticker_id`
 
-- Sync sticker sets from a set name or `t.me/addstickers/...` link
-- Optional automatic collection of newly seen Telegram sticker sets
-- Gemini Embedding 2 for both sticker indexing and query embedding
-- Local SQLite vector storage
-- Fast in-memory similarity search
-- Returns Telegram `sticker_id` values for agent-side sticker sending
+如果你想要的是：
+- 让 OpenClaw 更会发表情包
+- 能按“开心 / 委屈 / 无语 / 摆烂”这种感觉去找图
+- 不想搞一堆重型依赖和复杂服务
 
-## Requirements
+那这个插件就是干这个的。
 
-- OpenClaw with Telegram configured
-- A working Telegram bot token
-- A Gemini API key for embeddings
-- Node.js **18+**
-- `ffmpeg` recommended for animated or video stickers (`.tgs`, `.webm`) so preview frames can be extracted
+## 能做什么
 
-## Install
+- 手动同步一个表情包合集
+- 可选：自动收集聊天里新出现的表情包合集
+- 用自然语言搜索表情包
+- 返回 Telegram 可直接发送的 `sticker_id`
 
-### From source
+## 适合什么场景
+
+比如你想让 agent：
+- 看到别人发了一个新表情包合集后，自动记住它
+- 聊天时根据“开心、得意、委屈、无奈”自动找贴纸
+- 不依赖外部向量库，数据都留在本机
+
+## 依赖要求
+
+需要这些东西：
+
+- 已经配置好的 **OpenClaw**
+- 已经能正常工作的 **Telegram bot token**
+- 一个 **Gemini API key**（用于 Embedding）
+- **Node.js 18+**
+- 建议有 `ffmpeg`（这样 `.tgs`、`.webm` 这类动图贴纸也能抽预览帧）
+
+## 安装
+
+### 方式一：从源码安装
 
 ```bash
 git clone https://github.com/MashiroCodfish/telegram-stickers-brain.git
@@ -32,21 +52,35 @@ npm install
 openclaw plugins install .
 ```
 
-Restart the Gateway after installation.
+装完后重启 Gateway。
 
-### From npm (after npm publish)
+### 方式二：从 release 包安装
+
+先下载 release 里的 `roitium-telegram-stickers-brain-1.0.0.tgz`，然后执行：
+
+```bash
+openclaw plugins install ./roitium-telegram-stickers-brain-1.0.0.tgz
+```
+
+装完后重启 Gateway。
+
+### 方式三：从 npm 安装
 
 ```bash
 openclaw plugins install @roitium/telegram-stickers-brain
 ```
 
-Use this path only after the package has been published to npm.
+> 这个方式要等 npm 真正发布之后才能直接用。
 
-Restart the Gateway after installation.
+## 配置
 
-## Configuration
+把配置写到：
 
-Configure the plugin under `plugins.entries.telegram-stickers-brain`.
+```text
+plugins.entries.telegram-stickers-brain
+```
+
+最小示例：
 
 ```json5
 {
@@ -66,118 +100,132 @@ Configure the plugin under `plugins.entries.telegram-stickers-brain`.
 }
 ```
 
-### Config fields
+### 这些配置分别是什么意思？
 
 - `embeddingApiKey`
-  - Required: usually yes
-  - Default: none
-  - Description: Gemini API key used for embedding calls
+  - Gemini 的 API key
+  - 这是最重要的配置，没有它就没法建向量
 
 - `embeddingModel`
-  - Required: no
-  - Default: `gemini-embedding-2-preview`
-  - Description: Embedding model used for stickers and queries
+  - 默认是 `gemini-embedding-2-preview`
+  - 一般不用改
 
 - `embeddingDimensions`
-  - Required: no
-  - Default: `768`
-  - Description: Output dimensionality for vectors
+  - 向量维度
+  - 默认 `768`
+  - 一般也不用改
 
 - `autoCollect`
-  - Required: no
-  - Default: `true`
-  - Description: Automatically queue newly seen Telegram sticker sets
+  - 是否自动收集聊天里新出现的表情包合集
+  - `true` = 开启
+  - `false` = 完全手动
 
-If `embeddingApiKey` is omitted, the plugin also checks:
+如果你没在插件配置里写 `embeddingApiKey`，插件也会尝试读取这些环境变量：
 
 - `GEMINI_API_KEY`
 - `GOOGLE_API_KEY`
 
-## Tools
+## 怎么用
 
-The plugin exposes these tools to the agent:
+这个插件会给 OpenClaw 提供 3 个工具：
 
 - `sync_sticker_set_by_name`
 - `get_sticker_stats`
 - `search_sticker_by_emotion`
 
-## How it works
+### 1）同步一个表情包合集
 
-### Indexing
+可以传合集名，也可以直接传 Telegram 链接：
 
-When a sticker set is synced:
+```json
+{"setNameOrUrl":"https://t.me/addstickers/YourStickerSet"}
+```
 
-1. The plugin fetches the set from Telegram
-2. Sticker files are downloaded
-3. A preview image is used directly or extracted with `ffmpeg`
-4. Gemini Embedding 2 generates normalized vectors
-5. Vectors are stored in local SQLite
+### 2）查看当前索引状态
 
-### Search
+```json
+{}
+```
 
-When a query is searched:
+它会告诉你：
+- 现在已经索引了多少张表情包
+- 队列里还有几个合集
+- 自动收集现在是不是开着
 
-1. The query is embedded with Gemini Embedding 2
-2. Sticker vectors are loaded into memory
-3. Cosine similarity is computed locally
-4. The best match is returned as a Telegram `sticker_id`
+### 3）按语义搜索表情包
 
-## Typical workflow
+比如：
 
-### Manual workflow
+```json
+{"query":"开心 笑着 跑"}
+```
 
-1. Sync a sticker set
-2. Let indexing finish
-3. Search with an emotion or action query
-4. Send the returned sticker
+或者：
 
-### Optional automatic collection
+```json
+{"query":"无奈 叹气 摆烂"}
+```
 
-If `autoCollect` is enabled, newly seen Telegram sticker sets can be queued automatically and indexed in the background.
-
-## Search tips
-
-Concrete Chinese emotion / action / trait phrases work best.
-
-Examples:
-
-- `开心 笑着 跑`
-- `无奈 叹气 摆烂`
-- `委屈 哭哭`
-- `得意 比耶`
-
-Typical result format:
+返回结果长这样：
 
 ```json
 {"sticker_id":"CAACAgUAAxkBA..."}
 ```
 
-## Local data
+拿到这个 `sticker_id` 以后，agent 就可以直接发贴纸。
 
-The plugin stores local state in:
+## 推荐使用方式
 
-- `STATE_DIR/telegram-stickers-brain.sqlite` — vector index
-- `STATE_DIR/telegram-stickers-brain-tmp/` — temporary preview files
-- `STATE_DIR/telegram/sticker-cache.json` — used by optional automatic collection
+### 纯手动模式
 
-## Packaging
+适合你想完全自己控制：
 
-Create a tarball with:
+1. 手动同步几个常用表情包合集
+2. 等索引完成
+3. 聊天时按语义搜索
+4. 发出匹配到的贴纸
 
-```bash
-npm pack
-```
+### 自动收集模式
 
-OpenClaw can also install from a local tarball:
+适合你想让它越用越聪明：
 
-```bash
-openclaw plugins install ./roitium-telegram-stickers-brain-1.0.0.tgz
-```
+1. 打开 `autoCollect`
+2. 聊天里出现新的表情包合集时，插件会自动入队
+3. 后台慢慢建索引
+4. 之后搜索时就能搜到这些新图
 
-## Installation guides
+## 搜索建议
 
-- Agent/operator guide: [docs/AGENT_INSTALL.md](docs/AGENT_INSTALL.md)
-- OpenClaw auto-install guide: [docs/OPENCLAW_AUTO_INSTALL.md](docs/OPENCLAW_AUTO_INSTALL.md)
+搜索词尽量写得像人在描述表情：
+
+好例子：
+- `开心 笑着 跑`
+- `得意 比耶`
+- `委屈 哭哭`
+- `无奈 叹气 摆烂`
+- `生气 拍桌子`
+
+一般来说，**情绪 + 动作 + 特征** 这种组合最好用。
+
+## 数据存在哪里
+
+插件会在本地保存这些数据：
+
+- `STATE_DIR/telegram-stickers-brain.sqlite`
+  - 表情包向量索引
+
+- `STATE_DIR/telegram-stickers-brain-tmp/`
+  - 临时文件目录
+
+- `STATE_DIR/telegram/sticker-cache.json`
+  - 自动收集模式下，用来识别新合集
+
+## 其他文档
+
+如果你是人类运维或者别的 agent，可以看：
+
+- 安装/验证文档：`docs/AGENT_INSTALL.md`
+- 给其他 OpenClaw 实例自动安装的文档：`docs/OPENCLAW_AUTO_INSTALL.md`
 
 ## License
 

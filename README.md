@@ -1,10 +1,10 @@
 [中文](./README.md) | [English](./README.en.md)
 
-# telegram-sticker-search
+# tg-stickers-chat
 
-一个给 **OpenClaw** 用的 Telegram 表情包语义搜索插件。
+一个给 **OpenClaw** 用的 Telegram 贴纸聊天增强插件。
 
-它的目标很简单：让 OpenClaw 能更自然地按语义找表情包、发表情包。
+它的目标很简单：让 agent 在聊天里更自然地主动使用贴纸，丰富对话，而不是只会发纯文字。
 
 ---
 
@@ -13,24 +13,24 @@
 ### 方式一：直接从 npm 安装
 
 ```bash
-openclaw plugins install telegram-sticker-search
+openclaw plugins install tg-stickers-chat
 openclaw gateway restart
 ```
 
 ### 方式二：从 Release 包安装
 
-先下载 Release 页面里的 `telegram-sticker-search-1.0.0.tgz`，然后执行：
+先下载 Release 页面里的 `tg-stickers-chat-1.0.0.tgz`，然后执行：
 
 ```bash
-openclaw plugins install ./telegram-sticker-search-1.0.0.tgz
+openclaw plugins install ./tg-stickers-chat-1.0.0.tgz
 openclaw gateway restart
 ```
 
 ### 方式三：从源码安装
 
 ```bash
-git clone https://github.com/MashiroCodfish/telegram-sticker-search.git
-cd telegram-sticker-search
+git clone https://github.com/MashiroCodfish/tg-stickers-chat.git
+cd tg-stickers-chat
 npm install
 openclaw plugins install .
 openclaw gateway restart
@@ -60,9 +60,9 @@ openclaw gateway restart
 3. 如果是静态图就直接用原图；如果是动图或视频，就抽一帧预览图
 4. 用 **Gemini Embedding 2** 给贴纸生成向量
 5. 把向量存到本地 **SQLite**
-6. 搜索时，再把查询词转成向量
+6. 聊天时，agent 可以把语义查询转成向量
 7. 在本地内存里做相似度匹配
-8. 返回最合适的 Telegram `sticker_id`
+8. 找到合适的 Telegram `sticker_id` 后发出去
 
 如果打开了 `autoCollect`，聊天里出现新的表情包合集时，插件会自动把它加入处理队列；但索引和搜索核心逻辑不会变化。
 
@@ -79,7 +79,7 @@ openclaw gateway restart
 配置写在这里：
 
 ```text
-plugins.entries.telegram-sticker-search
+plugins.entries.tg-stickers-chat
 ```
 
 最小配置示例：
@@ -88,7 +88,7 @@ plugins.entries.telegram-sticker-search
 {
   "plugins": {
     "entries": {
-      "telegram-sticker-search": {
+      "tg-stickers-chat": {
         "enabled": true,
         "config": {
           "embeddingApiKey": "YOUR_GEMINI_API_KEY",
@@ -125,6 +125,8 @@ plugins.entries.telegram-sticker-search
 
 - `GEMINI_API_KEY`
 - `GOOGLE_API_KEY`
+
+如果你希望 agent 发贴纸更频繁一点、或者克制一点，也可以直接在聊天里告诉它，或者把偏好写进 memory，让它自己调整发贴纸的频率。
 
 如果你要让别的 OpenClaw 实例全自动安装这个插件，可以看：
 

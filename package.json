@@ -1,7 +1,7 @@
 {
-  "name": "telegram-sticker-search",
+  "name": "tg-stickers-chat",
   "version": "1.0.0",
-  "description": "OpenClaw Telegram sticker search plugin built around Gemini Embedding 2 and local vector similarity search.",
+  "description": "OpenClaw Telegram sticker chat enhancement plugin built around Gemini Embedding 2 and local vector similarity search.",
   "main": "index.js",
   "openclaw": {
     "extensions": [
@@ -23,11 +23,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MashiroCodfish/telegram-sticker-search.git"
+    "url": "git+https://github.com/MashiroCodfish/tg-stickers-chat.git"
   },
-  "homepage": "https://github.com/MashiroCodfish/telegram-sticker-search#readme",
+  "homepage": "https://github.com/MashiroCodfish/tg-stickers-chat#readme",
   "bugs": {
-    "url": "https://github.com/MashiroCodfish/telegram-sticker-search/issues"
+    "url": "https://github.com/MashiroCodfish/tg-stickers-chat/issues"
   },
   "publishConfig": {
     "access": "public"

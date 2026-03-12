@@ -1,12 +1,24 @@
-# OpenClaw Auto-Install Guide: telegram-sticker-search 1.0.0
+# OpenClaw Auto-Install Guide: tg-stickers-chat 1.0.0
 
 Use this document when another OpenClaw deployment, or an agent managing that deployment, needs to install this plugin automatically.
 
 ## Plugin identity
 
-- npm package: `telegram-sticker-search`
-- plugin id: `telegram-sticker-search`
-- config path: `plugins.entries.telegram-sticker-search`
+- npm package: `tg-stickers-chat`
+- plugin id: `tg-stickers-chat`
+- config path: `plugins.entries.tg-stickers-chat`
+
+## What this plugin does
+
+This plugin helps an OpenClaw agent use Telegram stickers more naturally in chat.
+
+Under the hood it provides:
+
+- sticker set syncing
+- local indexing with Gemini Embedding 2
+- local SQLite storage
+- local in-memory similarity search
+- optional automatic collection through `autoCollect`
 
 ## Prerequisites
 
@@ -23,7 +35,7 @@ The target OpenClaw instance should already have:
 ### Option A: install from npm
 
 ```bash
-openclaw plugins install telegram-sticker-search
+openclaw plugins install tg-stickers-chat
 ```
 
 ### Option B: install from a release tarball
@@ -31,14 +43,14 @@ openclaw plugins install telegram-sticker-search
 Download the release asset first, then run:
 
 ```bash
-openclaw plugins install ./telegram-sticker-search-1.0.0.tgz
+openclaw plugins install ./tg-stickers-chat-1.0.0.tgz
 ```
 
 ### Option C: install from source
 
 ```bash
-git clone https://github.com/MashiroCodfish/telegram-sticker-search.git
-cd telegram-sticker-search
+git clone https://github.com/MashiroCodfish/tg-stickers-chat.git
+cd tg-stickers-chat
 npm install
 openclaw plugins install .
 ```
@@ -51,7 +63,7 @@ Merge this into the target OpenClaw config:
 {
   "plugins": {
     "entries": {
-      "telegram-sticker-search": {
+      "tg-stickers-chat": {
         "enabled": true,
         "config": {
           "embeddingApiKey": "YOUR_GEMINI_API_KEY",
@@ -86,7 +98,7 @@ openclaw plugins list
 ### 2. Confirm the plugin info looks correct
 
 ```bash
-openclaw plugins info telegram-sticker-search
+openclaw plugins info tg-stickers-chat
 ```
 
 ### 3. Confirm the tools exist
@@ -122,13 +134,3 @@ get_sticker_stats({})
 ```text
 search_sticker_by_emotion({"query":"开心 笑着 跑"})
 ```
-
-## Summary
-
-This plugin provides:
-
-- Gemini Embedding 2 for sticker vectors
-- local SQLite storage
-- local in-memory search
-- manual sticker-set sync
-- optional automatic collection with `autoCollect`

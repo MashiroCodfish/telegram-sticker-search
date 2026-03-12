@@ -1,29 +1,20 @@
 {
   "id": "telegram-stickers-brain",
   "name": "Telegram Stickers Brain",
-  "description": "Semantic Telegram sticker management with Gemini captioning, Embedding 2 indexing, and auto collection",
-  "version": "2.4.1",
+  "description": "Minimal Telegram sticker semantic search for OpenClaw using Gemini Embedding 2 and local SQLite/in-memory vector search",
+  "version": "1.0.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "vlmModel": {
+      "embeddingApiKey": {
         "type": "string",
-        "default": "gemini-3.1-flash-lite-preview",
-        "description": "Model used for background sticker captioning"
-      },
-      "vlmApiKey": {
-        "type": "string",
-        "description": "Gemini API Key for VLM captioning"
+        "description": "Gemini API key used for embedding calls"
       },
       "embeddingModel": {
         "type": "string",
         "default": "gemini-embedding-2-preview",
-        "description": "Gemini embedding model used for the sticker semantic index"
-      },
-      "embeddingApiKey": {
-        "type": "string",
-        "description": "Optional separate Gemini API Key for embedding calls; defaults to vlmApiKey when omitted"
+        "description": "Gemini embedding model used for sticker and query embeddings"
       },
       "embeddingDimensions": {
         "type": "integer",
@@ -31,29 +22,12 @@
         "minimum": 128,
         "maximum": 3072,
         "description": "Output dimensionality for embedding vectors"
-      },
-      "autoCollect": {
-        "type": "boolean",
-        "default": true,
-        "description": "Whether to automatically collect new sticker sets when seen"
-      },
-      "notifyChatId": {
-        "type": "string",
-        "description": "If set, sends a message to this Chat ID when sync starts/finishes"
       }
     }
   },
   "uiHints": {
-    "vlmApiKey": {
-      "label": "Gemini API Key",
-      "sensitive": true
-    },
-    "vlmModel": {
-      "label": "VLM Model Name",
-      "placeholder": "gemini-3.1-flash-lite-preview"
-    },
     "embeddingApiKey": {
-      "label": "Embedding API Key",
+      "label": "Gemini Embedding API Key",
       "sensitive": true
     },
     "embeddingModel": {
@@ -62,13 +36,6 @@
     },
     "embeddingDimensions": {
       "label": "Embedding Dimensions"
-    },
-    "autoCollect": {
-      "label": "Auto Collect New Sets"
-    },
-    "notifyChatId": {
-      "label": "Admin Chat ID (for notifications)",
-      "placeholder": "e.g. 123456789"
     }
   }
 }

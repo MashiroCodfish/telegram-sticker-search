@@ -1,7 +1,7 @@
 {
   "name": "@roitium/telegram-stickers-brain",
-  "version": "2.4.1",
-  "description": "Telegram sticker semantic search plugin for OpenClaw using Gemini Embedding 2, local SQLite indexing, and auto-collection.",
+  "version": "1.0.0",
+  "description": "Fresh OpenClaw Telegram sticker search plugin built around Gemini Embedding 2 and local vector similarity search.",
   "main": "index.js",
   "openclaw": {
     "extensions": [
@@ -16,7 +16,8 @@
     "semantic-search",
     "gemini",
     "embedding",
-    "sqlite"
+    "sqlite",
+    "vector-search"
   ],
   "author": "Mashiro",
   "license": "MIT",
@@ -36,7 +37,7 @@
     "better-sqlite3": "^12.6.2"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   },
   "files": [
     "index.js",

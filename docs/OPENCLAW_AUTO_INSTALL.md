@@ -1,4 +1,4 @@
-# OpenClaw Auto-Install Guide: tg-stickers-chat 1.0.2
+# OpenClaw Auto-Install Guide: tg-stickers-chat 1.0.3
 
 Use this document when another OpenClaw deployment, or an agent managing that deployment, needs to install this plugin automatically.
 
@@ -43,7 +43,7 @@ openclaw plugins install tg-stickers-chat
 Download the release asset first, then run:
 
 ```bash
-openclaw plugins install ./tg-stickers-chat-1.0.2.tgz
+openclaw plugins install ./tg-stickers-chat-1.0.3.tgz
 ```
 
 ### Option C: install from source

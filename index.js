@@ -14,6 +14,7 @@ module.exports = function registerTelegramStickersBrain(api) {
   const LEGACY_SEARCH_STATE_FILE = path.join(STATE_DIR, `${PLUGIN_ID}-search-state.json`);
 
   const SEARCH_RECALL_LIMIT = 36;
+  const SEARCH_RECALL_CANDIDATE_WINDOW = 240;
   const SEARCH_HISTORY_LIMIT = 48;
   const SEARCH_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
   const SEARCH_STICKER_DEDUPE_WINDOW_MS = 10 * 60 * 1000;
@@ -1078,6 +1079,48 @@ module.exports = function registerTelegramStickersBrain(api) {
     });
   }
 
+  function buildDiversifiedRecallPool(scoredCandidates, limit = SEARCH_RECALL_LIMIT) {
+    const windowed = scoredCandidates.slice(0, Math.max(limit, SEARCH_RECALL_CANDIDATE_WINDOW));
+    if (windowed.length <= limit) return windowed;
+
+    const selected = [];
+    const selectedKeys = new Set();
+    const perSetCounts = new Map();
+
+    for (let roundCap = 1; selected.length < limit; roundCap += 1) {
+      let addedThisRound = 0;
+
+      for (const candidate of windowed) {
+        if (selected.length >= limit) break;
+        const itemKey = candidate.fileUniqueId || candidate.fileId;
+        if (!itemKey || selectedKeys.has(itemKey)) continue;
+
+        const setKey = candidate.setName || `__no_set__:${itemKey}`;
+        const currentCount = perSetCounts.get(setKey) || 0;
+        if (currentCount >= roundCap) continue;
+
+        selected.push(candidate);
+        selectedKeys.add(itemKey);
+        perSetCounts.set(setKey, currentCount + 1);
+        addedThisRound += 1;
+      }
+
+      if (addedThisRound === 0) break;
+    }
+
+    if (selected.length < limit) {
+      for (const candidate of windowed) {
+        if (selected.length >= limit) break;
+        const itemKey = candidate.fileUniqueId || candidate.fileId;
+        if (!itemKey || selectedKeys.has(itemKey)) continue;
+        selected.push(candidate);
+        selectedKeys.add(itemKey);
+      }
+    }
+
+    return selected;
+  }
+
   function getRecentSelectionStats(recentSelections, candidate) {
     const stats = {
       recentStickerHits: 0,
@@ -1344,13 +1387,15 @@ module.exports = function registerTelegramStickersBrain(api) {
       loadSearchCache(attempt > 0);
       if (searchCache.length === 0) throw new Error('Sticker index is empty');
 
-      const recalled = searchCache
-        .map((item) => ({
-          ...item,
-          baseScore: scoreWithPhrases(item, embeddedPlan.phrases, ['reply', 'tail', 'emotion', 'act', 'context', 'summary']).score,
-        }))
-        .sort((a, b) => b.baseScore - a.baseScore)
-        .slice(0, SEARCH_RECALL_LIMIT);
+      const recalled = buildDiversifiedRecallPool(
+        searchCache
+          .map((item) => ({
+            ...item,
+            baseScore: scoreWithPhrases(item, embeddedPlan.phrases, ['reply', 'tail', 'emotion', 'act', 'context', 'summary']).score,
+          }))
+          .sort((a, b) => b.baseScore - a.baseScore),
+        SEARCH_RECALL_LIMIT,
+      );
 
       if (recalled.length === 0) throw new Error('No sticker candidates found');
 

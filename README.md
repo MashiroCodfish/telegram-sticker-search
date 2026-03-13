@@ -21,10 +21,10 @@ openclaw gateway restart
 
 ### Release 包
 
-下载 Release 页面里的 `tg-stickers-chat-1.0.2.tgz`，然后执行：
+下载 Release 页面里的 `tg-stickers-chat-1.0.3.tgz`，然后执行：
 
 ```bash
-openclaw plugins install ./tg-stickers-chat-1.0.2.tgz
+openclaw plugins install ./tg-stickers-chat-1.0.3.tgz
 openclaw gateway restart
 ```
 

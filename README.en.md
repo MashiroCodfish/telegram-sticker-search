@@ -21,10 +21,10 @@ openclaw gateway restart
 
 ### Release package
 
-Download `tg-stickers-chat-1.0.2.tgz` from Releases, then run:
+Download `tg-stickers-chat-1.0.3.tgz` from Releases, then run:
 
 ```bash
-openclaw plugins install ./tg-stickers-chat-1.0.2.tgz
+openclaw plugins install ./tg-stickers-chat-1.0.3.tgz
 openclaw gateway restart
 ```
 

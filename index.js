@@ -11,22 +11,33 @@ module.exports = function registerTelegramStickersBrain(api) {
   const INDEX_DB_PATH = path.join(STATE_DIR, `${PLUGIN_ID}.sqlite`);
   const TMP_DIR = path.join(STATE_DIR, `${PLUGIN_ID}-tmp`);
   const CORE_CACHE_FILE = path.join(STATE_DIR, 'telegram', 'sticker-cache.json');
+  const LEGACY_SEARCH_STATE_FILE = path.join(STATE_DIR, `${PLUGIN_ID}-search-state.json`);
+
+  const SEARCH_RECALL_LIMIT = 36;
+  const SEARCH_HISTORY_LIMIT = 48;
+  const SEARCH_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
+  const SEARCH_STICKER_DEDUPE_WINDOW_MS = 10 * 60 * 1000;
+  const QUERY_EMBED_CACHE_LIMIT = 256;
+  const RECENT_QUEUE_TTL_MS = 10 * 60 * 1000;
 
   fs.mkdirSync(TMP_DIR, { recursive: true });
 
   let indexDb = null;
   let searchCacheLoaded = false;
+  let searchCacheFingerprint = '';
   let searchCache = [];
   let searchCacheById = new Map();
 
   let genAI = null;
   let genAIKey = '';
   const modelCache = new Map();
+  const queryEmbeddingCache = new Map();
 
   const syncQueue = [];
   const queuedSets = new Set();
   const recentQueuedSets = new Map();
   let syncRunning = false;
+  let legacySelectionStateImported = false;
 
   function getPluginConfig() {
     return api.config?.plugins?.entries?.[PLUGIN_ID]?.config || {};
@@ -83,9 +94,250 @@ module.exports = function registerTelegramStickersBrain(api) {
       .trim();
   }
 
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+
   function parseTs(value) {
     const ts = value ? new Date(value).getTime() : NaN;
     return Number.isFinite(ts) ? ts : 0;
+  }
+
+  function safeParseJsonObject(text) {
+    const normalized = String(text || '').trim();
+    if (!normalized || normalized[0] !== '{') return null;
+    try {
+      const parsed = JSON.parse(normalized);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function toTextList(value) {
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => normalizeWhitespace(item))
+        .filter(Boolean);
+    }
+    if (typeof value === 'string' || typeof value === 'number') {
+      const normalized = normalizeWhitespace(String(value));
+      return normalized ? [normalized] : [];
+    }
+    return [];
+  }
+
+  function uniqueTexts(values) {
+    const seen = new Set();
+    const result = [];
+    for (const value of values) {
+      const normalized = normalizeWhitespace(value);
+      if (!normalized) continue;
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      result.push(normalized);
+    }
+    return result;
+  }
+
+  function collectTextValues(source, keys) {
+    const values = [];
+    for (const key of keys) {
+      values.push(...toTextList(source?.[key]));
+    }
+    return uniqueTexts(values);
+  }
+
+  function extractLastSentence(text) {
+    const normalized = normalizeWhitespace(text);
+    if (!normalized) return '';
+    const pieces = normalized
+      .split(/[\n。！？!?]+/)
+      .map((part) => normalizeWhitespace(part))
+      .filter(Boolean);
+    return pieces.length > 1 ? pieces[pieces.length - 1] : '';
+  }
+
+  function normalizeBoolean(value) {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return null;
+    if (['true', '1', 'yes', 'y', 'on', 'send', 'allow', 'required', 'force'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'n', 'off', 'skip', 'disable', 'avoid'].includes(normalized)) return false;
+    return null;
+  }
+
+  function normalizeIntensity(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      if (value <= 0.3) return 'low';
+      if (value <= 0.65) return 'medium';
+      if (value <= 0.9) return 'high';
+      return 'max';
+    }
+
+    const normalized = normalizeWhitespace(value).toLowerCase();
+    if (!normalized) return '';
+    if (/^(low|soft|light|轻|低|微弱|淡|克制)/.test(normalized)) return 'low';
+    if (/^(medium|mid|normal|moderate|中|普通|正常|适中)/.test(normalized)) return 'medium';
+    if (/^(high|strong|big|heavy|高|强|明显|很强|激动)/.test(normalized)) return 'high';
+    if (/^(max|extreme|爆炸|拉满|极高|失控|特别强|超强)/.test(normalized)) return 'max';
+    return normalized;
+  }
+
+  function intensityToChineseLabel(intensity) {
+    switch (intensity) {
+      case 'low': return '轻';
+      case 'medium': return '中';
+      case 'high': return '强';
+      case 'max': return '拉满';
+      default: return normalizeWhitespace(intensity);
+    }
+  }
+
+  function normalizeStructuredIntent(rawInput) {
+    const rawText = normalizeWhitespace(rawInput);
+    if (!rawText) {
+      throw new Error('Search query is empty');
+    }
+
+    const payload = safeParseJsonObject(rawText);
+    if (!payload) {
+      const plainReplyText = rawText.length >= 12 || /[。！？!?~～]/.test(rawText) ? rawText : '';
+      return {
+        rawInput: rawText,
+        mode: 'plain',
+        legacyMode: true,
+        replyText: plainReplyText,
+        emotions: [],
+        acts: [],
+        contexts: [],
+        keywords: uniqueTexts([rawText]),
+        forbid: [],
+        intensity: '',
+        intensityLabel: '',
+        explicitShouldSend: null,
+        forceSend: false,
+        skipRequested: false,
+      };
+    }
+
+    const replyText = collectTextValues(payload, [
+      'replyText', 'finalReply', 'finalText', 'responseText', 'reply', 'text', 'message', 'content'
+    ])[0] || '';
+    const emotions = collectTextValues(payload, [
+      'emotion', 'emotions', 'mood', 'feeling', 'feelings', 'emotionQuery'
+    ]);
+    const acts = collectTextValues(payload, [
+      'act', 'acts', 'action', 'actions', 'gesture', 'reaction', 'pose', 'movement'
+    ]);
+    const contexts = collectTextValues(payload, [
+      'context', 'contexts', 'scene', 'situation', 'tone', 'tones', 'style', 'styles', 'useCase'
+    ]);
+    const keywords = collectTextValues(payload, [
+      'query', 'keywords', 'tags', 'tag', 'extra', 'extras', 'hint', 'hints'
+    ]);
+    const forbid = collectTextValues(payload, [
+      'forbid', 'forbids', 'avoid', 'avoids', 'exclude', 'excludes', 'ban', 'bans', 'dislike'
+    ]);
+
+    const explicitShouldSend = normalizeBoolean(
+      payload.shouldSend ?? payload.sendSticker ?? payload.allowSticker
+    );
+    const forceSend = normalizeBoolean(payload.force ?? payload.requireSticker) === true;
+    const skipRequested = normalizeBoolean(payload.skip) === true || explicitShouldSend === false;
+    const intensity = normalizeIntensity(payload.intensity ?? payload.energy ?? payload.strength);
+
+    return {
+      rawInput: rawText,
+      mode: 'structured',
+      legacyMode: false,
+      replyText,
+      emotions,
+      acts,
+      contexts,
+      keywords,
+      forbid,
+      intensity,
+      intensityLabel: intensityToChineseLabel(intensity),
+      explicitShouldSend,
+      forceSend,
+      skipRequested,
+    };
+  }
+
+  function buildIntentSummary(intent) {
+    const chunks = [];
+
+    if (intent.replyText) chunks.push(`回复：${intent.replyText}`);
+    if (intent.emotions.length > 0) chunks.push(`情绪：${intent.emotions.join(' / ')}`);
+    if (intent.acts.length > 0) chunks.push(`动作：${intent.acts.join(' / ')}`);
+    if (intent.contexts.length > 0) chunks.push(`语境：${intent.contexts.join(' / ')}`);
+    if (intent.intensityLabel) chunks.push(`强度：${intent.intensityLabel}`);
+    if (intent.keywords.length > 0) chunks.push(`补充：${intent.keywords.join(' / ')}`);
+    if (intent.forbid.length > 0) chunks.push(`避免：${intent.forbid.join(' / ')}`);
+
+    return chunks.join('；');
+  }
+
+  function buildIntentPlan(rawInput) {
+    const intent = normalizeStructuredIntent(rawInput);
+    const phrases = [];
+    const seen = new Set();
+
+    function addPhrase(kind, text, weight) {
+      const normalized = normalizeWhitespace(text);
+      if (!normalized) return;
+      const key = `${kind}:${normalized}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      phrases.push({ kind, text: normalized, weight });
+    }
+
+    if (intent.replyText) {
+      addPhrase('reply', intent.replyText, 1.0);
+      const tail = extractLastSentence(intent.replyText);
+      if (tail && tail !== intent.replyText) addPhrase('tail', tail, 0.93);
+    }
+
+    if (intent.emotions.length > 0) {
+      addPhrase('emotion', intent.emotions.join(' '), 0.82);
+    }
+
+    if (intent.acts.length > 0) {
+      addPhrase('act', intent.acts.join(' '), 0.76);
+    }
+
+    const contextBits = [];
+    if (intent.contexts.length > 0) contextBits.push(intent.contexts.join(' '));
+    if (intent.intensityLabel) contextBits.push(`强度 ${intent.intensityLabel}`);
+    if (contextBits.length > 0) addPhrase('context', contextBits.join(' '), 0.68);
+
+    const summaryBits = [];
+    if (intent.emotions.length > 0) summaryBits.push(intent.emotions.join(' '));
+    if (intent.acts.length > 0) summaryBits.push(intent.acts.join(' '));
+    if (intent.contexts.length > 0) summaryBits.push(intent.contexts.join(' '));
+    if (intent.intensityLabel) summaryBits.push(`情绪强度 ${intent.intensityLabel}`);
+    if (intent.keywords.length > 0) summaryBits.push(intent.keywords.join(' '));
+    if (summaryBits.length > 0) addPhrase('summary', summaryBits.join(' '), intent.replyText ? 0.9 : 1.0);
+
+    if (intent.forbid.length > 0) {
+      addPhrase('forbid', intent.forbid.join(' '), 1.0);
+    }
+
+    if (phrases.length === 0) {
+      addPhrase('summary', intent.rawInput, 1.0);
+    }
+
+    return {
+      rawInput: intent.rawInput,
+      mode: intent.mode,
+      legacyMode: intent.legacyMode,
+      intent,
+      phrases,
+      intentSummary: buildIntentSummary(intent) || intent.rawInput,
+    };
   }
 
   function normalizeVector(values) {
@@ -95,7 +347,6 @@ module.exports = function registerTelegramStickersBrain(api) {
 
     const vector = values.map(Number);
     let sumSq = 0;
-
     for (const value of vector) {
       if (!Number.isFinite(value)) {
         throw new Error('Embedding vector contains non-finite values');
@@ -136,6 +387,30 @@ module.exports = function registerTelegramStickersBrain(api) {
         );
         CREATE INDEX IF NOT EXISTS idx_stickers_index_set_name ON stickers_index(set_name);
         CREATE INDEX IF NOT EXISTS idx_stickers_index_updated_at ON stickers_index(updated_at);
+
+        CREATE TABLE IF NOT EXISTS synced_sets (
+          set_name TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          total INTEGER NOT NULL DEFAULT 0,
+          indexed_count INTEGER NOT NULL DEFAULT 0,
+          skipped_count INTEGER NOT NULL DEFAULT 0,
+          failed_count INTEGER NOT NULL DEFAULT 0,
+          last_synced_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_synced_sets_status ON synced_sets(status);
+        CREATE INDEX IF NOT EXISTS idx_synced_sets_last_synced_at ON synced_sets(last_synced_at);
+
+        CREATE TABLE IF NOT EXISTS selection_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          file_unique_id TEXT,
+          file_id TEXT,
+          set_name TEXT,
+          intent_text TEXT,
+          chosen_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_selection_history_chosen_at ON selection_history(chosen_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_selection_history_file_unique_id ON selection_history(file_unique_id);
+        CREATE INDEX IF NOT EXISTS idx_selection_history_set_name ON selection_history(set_name);
       `);
     }
     return indexDb;
@@ -149,8 +424,24 @@ module.exports = function registerTelegramStickersBrain(api) {
     }
   }
 
+  function getSearchCacheFingerprint() {
+    const row = ensureIndexDb().prepare(`
+      SELECT COUNT(*) AS count, COALESCE(MAX(updated_at), '') AS max_updated_at
+      FROM stickers_index
+    `).get();
+    return `${Number(row?.count || 0)}:${String(row?.max_updated_at || '')}`;
+  }
+
+  function invalidateSearchCache() {
+    searchCacheLoaded = false;
+    searchCacheFingerprint = '';
+  }
+
   function loadSearchCache(force = false) {
-    if (searchCacheLoaded && !force) return searchCache;
+    const currentFingerprint = getSearchCacheFingerprint();
+    if (searchCacheLoaded && !force && searchCacheFingerprint === currentFingerprint) {
+      return searchCache;
+    }
 
     const rows = ensureIndexDb().prepare(`
       SELECT file_unique_id, file_id, emoji, set_name, embedding_json
@@ -177,6 +468,7 @@ module.exports = function registerTelegramStickersBrain(api) {
     }
 
     searchCacheLoaded = true;
+    searchCacheFingerprint = currentFingerprint;
     api.logger.info(`[Stickers] Loaded ${searchCache.length} sticker embeddings into memory.`);
     return searchCache;
   }
@@ -186,6 +478,18 @@ module.exports = function registerTelegramStickersBrain(api) {
     if (searchCacheLoaded) return searchCacheById.has(fileUniqueId);
     const row = ensureIndexDb().prepare('SELECT 1 AS ok FROM stickers_index WHERE file_unique_id = ?').get(fileUniqueId);
     return !!row;
+  }
+
+  function hasIndexedStickerRow(fileUniqueId, fileId) {
+    if (fileUniqueId) {
+      const byUnique = ensureIndexDb().prepare('SELECT 1 AS ok FROM stickers_index WHERE file_unique_id = ?').get(fileUniqueId);
+      if (byUnique) return true;
+    }
+    if (fileId) {
+      const byFileId = ensureIndexDb().prepare('SELECT 1 AS ok FROM stickers_index WHERE file_id = ?').get(fileId);
+      if (byFileId) return true;
+    }
+    return false;
   }
 
   function upsertIndexedSticker(record) {
@@ -222,12 +526,204 @@ module.exports = function registerTelegramStickersBrain(api) {
         searchCache.push(cachedItem);
         searchCacheById.set(cachedItem.fileUniqueId, cachedItem);
       }
+      searchCacheFingerprint = getSearchCacheFingerprint();
     }
   }
 
   function getIndexedStickerCount() {
     const row = ensureIndexDb().prepare('SELECT COUNT(*) AS count FROM stickers_index').get();
     return Number(row?.count || 0);
+  }
+
+  function getCompletedSetCount() {
+    const row = ensureIndexDb().prepare(`
+      SELECT COUNT(*) AS count
+      FROM synced_sets
+      WHERE status = 'complete' AND failed_count = 0
+    `).get();
+    return Number(row?.count || 0);
+  }
+
+  function getSetSyncRecord(setName) {
+    if (!setName) return null;
+    return ensureIndexDb().prepare(`
+      SELECT set_name, status, total, indexed_count, skipped_count, failed_count, last_synced_at
+      FROM synced_sets
+      WHERE set_name = ?
+    `).get(setName) || null;
+  }
+
+  function hasCompletedSetSync(setName) {
+    const row = getSetSyncRecord(setName);
+    return !!row
+      && row.status === 'complete'
+      && Number(row.failed_count || 0) === 0
+      && Number(row.total || 0) > 0;
+  }
+
+  function recordSetSyncSummary(summary) {
+    const failedCount = Number(summary?.failedCount || 0);
+    const indexedCount = Number(summary?.indexedCount || 0);
+    const skippedCount = Number(summary?.skippedCount || 0);
+    const total = Number(summary?.total || 0);
+    const status = failedCount > 0
+      ? ((indexedCount + skippedCount) > 0 ? 'partial' : 'failed')
+      : 'complete';
+
+    ensureIndexDb().prepare(`
+      INSERT INTO synced_sets (
+        set_name, status, total, indexed_count, skipped_count, failed_count, last_synced_at
+      ) VALUES (
+        @set_name, @status, @total, @indexed_count, @skipped_count, @failed_count, @last_synced_at
+      )
+      ON CONFLICT(set_name) DO UPDATE SET
+        status = excluded.status,
+        total = excluded.total,
+        indexed_count = excluded.indexed_count,
+        skipped_count = excluded.skipped_count,
+        failed_count = excluded.failed_count,
+        last_synced_at = excluded.last_synced_at
+    `).run({
+      set_name: String(summary?.setName || '').trim(),
+      status,
+      total,
+      indexed_count: indexedCount,
+      skipped_count: skippedCount,
+      failed_count: failedCount,
+      last_synced_at: summary?.updatedAt || new Date().toISOString(),
+    });
+  }
+
+  function pruneSelectionHistory() {
+    const cutoff = new Date(Date.now() - SEARCH_HISTORY_TTL_MS).toISOString();
+    ensureIndexDb().prepare('DELETE FROM selection_history WHERE chosen_at < ?').run(cutoff);
+
+    const overflow = ensureIndexDb().prepare(`
+      SELECT id
+      FROM selection_history
+      ORDER BY chosen_at DESC, id DESC
+      LIMIT -1 OFFSET ?
+    `).all(SEARCH_HISTORY_LIMIT);
+
+    if (overflow.length > 0) {
+      const deleteStmt = ensureIndexDb().prepare('DELETE FROM selection_history WHERE id = ?');
+      const tx = ensureIndexDb().transaction((rows) => {
+        for (const row of rows) deleteStmt.run(row.id);
+      });
+      tx(overflow);
+    }
+  }
+
+  function importLegacySelectionStateIfNeeded() {
+    if (legacySelectionStateImported) return;
+    legacySelectionStateImported = true;
+
+    if (!fs.existsSync(LEGACY_SEARCH_STATE_FILE)) return;
+
+    const historyCount = ensureIndexDb().prepare('SELECT COUNT(*) AS count FROM selection_history').get();
+    if (Number(historyCount?.count || 0) > 0) return;
+
+    try {
+      const parsed = JSON.parse(fs.readFileSync(LEGACY_SEARCH_STATE_FILE, 'utf8'));
+      const recentSelections = Array.isArray(parsed?.recentSelections) ? parsed.recentSelections : [];
+      if (recentSelections.length === 0) return;
+
+      const insert = ensureIndexDb().prepare(`
+        INSERT INTO selection_history (file_unique_id, file_id, set_name, intent_text, chosen_at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      const tx = ensureIndexDb().transaction((rows) => {
+        for (const entry of rows) {
+          const chosenAt = entry?.selectedAt || entry?.chosenAt;
+          if (!parseTs(chosenAt)) continue;
+          insert.run(
+            entry?.fileUniqueId || '',
+            entry?.fileId || '',
+            entry?.setName || '',
+            normalizeWhitespace(entry?.queryText || entry?.intentText || ''),
+            new Date(chosenAt).toISOString(),
+          );
+        }
+      });
+      tx(recentSelections);
+      pruneSelectionHistory();
+      api.logger.info(`[Stickers] Imported ${recentSelections.length} legacy search history entries into SQLite.`);
+    } catch (e) {
+      api.logger.warn(`[Stickers] Failed to import legacy search state: ${e.message}`);
+    }
+  }
+
+  function listRecentSelections() {
+    importLegacySelectionStateIfNeeded();
+    pruneSelectionHistory();
+
+    const rows = ensureIndexDb().prepare(`
+      SELECT file_unique_id, file_id, set_name, intent_text, chosen_at
+      FROM selection_history
+      ORDER BY chosen_at DESC, id DESC
+      LIMIT ?
+    `).all(SEARCH_HISTORY_LIMIT);
+
+    return rows
+      .map((row) => ({
+        fileUniqueId: row.file_unique_id || '',
+        fileId: row.file_id || '',
+        setName: row.set_name || '',
+        intentText: row.intent_text || '',
+        selectedAt: row.chosen_at,
+      }))
+      .filter((entry) => parseTs(entry.selectedAt) > 0);
+  }
+
+  function rememberSearchSelection(result, intentSummary) {
+    if (!result?.fileId && !result?.fileUniqueId) return;
+    importLegacySelectionStateIfNeeded();
+
+    ensureIndexDb().prepare(`
+      INSERT INTO selection_history (file_unique_id, file_id, set_name, intent_text, chosen_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      result.fileUniqueId || '',
+      result.fileId || '',
+      result.setName || '',
+      normalizeWhitespace(intentSummary).slice(0, 400),
+      new Date().toISOString(),
+    );
+
+    pruneSelectionHistory();
+  }
+
+  async function bootstrapCompletedSetSync(setName) {
+    if (!setName || hasCompletedSetSync(setName)) return true;
+
+    const row = ensureIndexDb().prepare(`
+      SELECT COUNT(*) AS count
+      FROM stickers_index
+      WHERE set_name = ?
+    `).get(setName);
+    const indexedCount = Number(row?.count || 0);
+    if (indexedCount <= 0) return false;
+
+    try {
+      const stickerSet = await tgRequest('getStickerSet', { name: setName });
+      const total = Array.isArray(stickerSet?.stickers) ? stickerSet.stickers.length : 0;
+      if (total > 0 && indexedCount >= total) {
+        recordSetSyncSummary({
+          setName,
+          total,
+          indexedCount: 0,
+          skippedCount: total,
+          failedCount: 0,
+          updatedAt: new Date().toISOString(),
+        });
+        api.logger.info(`[Stickers] Backfilled completed sync state for ${setName} (${indexedCount}/${total}).`);
+        return true;
+      }
+    } catch (e) {
+      api.logger.warn(`[Stickers] Failed to verify existing sync state for ${setName}: ${e.message}`);
+    }
+
+    return false;
   }
 
   function ensureCoreCache() {
@@ -297,10 +793,15 @@ module.exports = function registerTelegramStickersBrain(api) {
     return path.join(TMP_DIR, `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
   }
 
+  function safeUnlink(filePathValue) {
+    try {
+      if (filePathValue && fs.existsSync(filePathValue)) fs.unlinkSync(filePathValue);
+    } catch (_) {}
+  }
+
   function buildPreviewImage(buffer, filePathValue) {
     const mimeType = guessMimeType(filePathValue);
-
-    if (mimeType === 'image/png' || mimeType === 'image/jpeg' || mimeType === 'image/webp' || mimeType === 'image/gif') {
+    if (mimeType === 'image/png' || mimeType === 'image/jpeg') {
       return { buffer, mimeType, source: 'original' };
     }
 
@@ -323,7 +824,7 @@ module.exports = function registerTelegramStickersBrain(api) {
         return {
           buffer: fs.readFileSync(outputPath),
           mimeType: 'image/png',
-          source: 'ffmpeg',
+          source: mimeType === 'image/webp' || mimeType === 'image/gif' ? 'ffmpeg-static-convert' : 'ffmpeg',
         };
       }
 
@@ -333,8 +834,8 @@ module.exports = function registerTelegramStickersBrain(api) {
       api.logger.warn(`[Stickers] Preview conversion error for ${filePathValue || 'unknown'}: ${e.message}`);
       return null;
     } finally {
-      try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (_) {}
-      try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
+      safeUnlink(inputPath);
+      safeUnlink(outputPath);
     }
   }
 
@@ -346,6 +847,7 @@ module.exports = function registerTelegramStickersBrain(api) {
       genAI = new GoogleGenerativeAI(apiKey);
       genAIKey = apiKey;
       modelCache.clear();
+      queryEmbeddingCache.clear();
     }
 
     const modelName = getEmbeddingModelName();
@@ -363,13 +865,35 @@ module.exports = function registerTelegramStickersBrain(api) {
     return values;
   }
 
+  function setCachedQueryEmbedding(key, vector) {
+    if (queryEmbeddingCache.has(key)) queryEmbeddingCache.delete(key);
+    queryEmbeddingCache.set(key, vector);
+    if (queryEmbeddingCache.size > QUERY_EMBED_CACHE_LIMIT) {
+      const oldestKey = queryEmbeddingCache.keys().next().value;
+      if (oldestKey) queryEmbeddingCache.delete(oldestKey);
+    }
+  }
+
   async function embedQueryText(queryText) {
+    const normalizedText = normalizeWhitespace(queryText);
+    if (!normalizedText) throw new Error('Embedding query text is empty');
+
+    const cacheKey = `${getEmbeddingModelName()}::${getEmbeddingDimensions()}::${normalizedText}`;
+    if (queryEmbeddingCache.has(cacheKey)) {
+      const cached = queryEmbeddingCache.get(cacheKey);
+      queryEmbeddingCache.delete(cacheKey);
+      queryEmbeddingCache.set(cacheKey, cached);
+      return cached;
+    }
+
     const response = await getEmbeddingModel().embedContent({
-      content: { parts: [{ text: String(queryText || '').trim() }] },
+      content: { parts: [{ text: normalizedText }] },
       taskType: 'RETRIEVAL_QUERY',
       outputDimensionality: getEmbeddingDimensions(),
     });
-    return normalizeVector(extractEmbeddingValues(response));
+    const vector = normalizeVector(extractEmbeddingValues(response));
+    setCachedQueryEmbedding(cacheKey, vector);
+    return vector;
   }
 
   async function embedStickerDocument({ imageBuffer, imageMimeType, emoji, setName, fileUniqueId }) {
@@ -384,19 +908,15 @@ module.exports = function registerTelegramStickersBrain(api) {
       });
     }
 
-    if (parts.length === 0) {
-      const metadataText = [
-        emoji ? `emoji: ${emoji}` : '',
-        setName ? `set: ${setName}` : '',
-        fileUniqueId ? `id: ${fileUniqueId}` : '',
-      ].filter(Boolean).join('\n');
+    const metadataText = [
+      'telegram sticker',
+      emoji ? `emoji: ${emoji}` : '',
+      setName ? `set: ${setName}` : '',
+      fileUniqueId ? `id: ${fileUniqueId}` : '',
+    ].filter(Boolean).join('\n');
 
-      if (!metadataText) {
-        throw new Error('No image preview or metadata available to embed');
-      }
-
-      parts.push({ text: metadataText });
-    }
+    if (metadataText) parts.push({ text: metadataText });
+    if (parts.length === 0) throw new Error('No image preview or metadata available to embed');
 
     const response = await getEmbeddingModel().embedContent({
       content: { parts },
@@ -497,39 +1017,400 @@ module.exports = function registerTelegramStickersBrain(api) {
     }
 
     checkpointIndexDb();
-    return {
+    const summary = {
       setName,
       total: stickers.length,
       indexedCount,
       skippedCount,
       failedCount,
+      updatedAt: new Date().toISOString(),
+    };
+    recordSetSyncSummary(summary);
+    return summary;
+  }
+
+  async function embedIntentPlan(plan) {
+    const embedded = [];
+    for (const phrase of plan.phrases) {
+      embedded.push({
+        ...phrase,
+        vector: await embedQueryText(phrase.text),
+      });
+    }
+
+    return {
+      ...plan,
+      phrases: embedded,
     };
   }
 
-  async function searchSticker(queryText) {
-    const trimmedQuery = String(queryText || '').trim();
-    if (!trimmedQuery) throw new Error('Search query is empty');
+  function scoreWithPhrases(item, phrases, allowedKinds) {
+    const allowedSet = allowedKinds ? new Set(allowedKinds) : null;
+    let best = -Infinity;
+    let matchedText = '';
 
-    loadSearchCache();
-    if (searchCache.length === 0) throw new Error('Sticker index is empty');
-
-    const queryVector = await embedQueryText(trimmedQuery);
-    let best = null;
-
-    for (const item of searchCache) {
-      const score = dotProduct(queryVector, item.embedding);
-      if (!best || score > best.score) {
-        best = {
-          fileId: item.fileId,
-          fileUniqueId: item.fileUniqueId,
-          score,
-          source: 'embedding2-local-search',
-        };
+    for (const phrase of phrases) {
+      if (allowedSet && !allowedSet.has(phrase.kind)) continue;
+      const score = dotProduct(phrase.vector, item.embedding) * (Number(phrase.weight) || 1);
+      if (score > best) {
+        best = score;
+        matchedText = phrase.text;
       }
     }
 
-    if (!best) throw new Error('No sticker candidates found');
-    return best;
+    return {
+      score: Number.isFinite(best) ? best : -Infinity,
+      matchedText,
+    };
+  }
+
+  function annotateTopCandidates(candidates) {
+    const seenSetCounts = new Map();
+    return candidates.map((candidate, index) => {
+      const setKey = candidate.setName || `__no_set__:${candidate.fileUniqueId}`;
+      const sameSetAhead = seenSetCounts.get(setKey) || 0;
+      seenSetCounts.set(setKey, sameSetAhead + 1);
+      return {
+        ...candidate,
+        baseRank: index + 1,
+        sameSetAhead,
+      };
+    });
+  }
+
+  function getRecentSelectionStats(recentSelections, candidate) {
+    const stats = {
+      recentStickerHits: 0,
+      recentSetHits: 0,
+      sameSetStreak: 0,
+      latestStickerAgeMs: null,
+    };
+
+    let streakOpen = true;
+    const now = Date.now();
+
+    for (const entry of recentSelections) {
+      const ageMs = now - parseTs(entry.selectedAt);
+      if (!Number.isFinite(ageMs) || ageMs < 0) continue;
+
+      if (candidate.fileUniqueId && entry.fileUniqueId === candidate.fileUniqueId) {
+        stats.recentStickerHits += 1;
+        if (stats.latestStickerAgeMs === null || ageMs < stats.latestStickerAgeMs) {
+          stats.latestStickerAgeMs = ageMs;
+        }
+      }
+
+      if (candidate.setName && entry.setName === candidate.setName) {
+        stats.recentSetHits += 1;
+        if (streakOpen) stats.sameSetStreak += 1;
+      } else if (streakOpen) {
+        streakOpen = false;
+      }
+    }
+
+    return stats;
+  }
+
+  function computeRepeatPenalty(candidate, recentSelections) {
+    const stats = getRecentSelectionStats(recentSelections, candidate);
+    let penalty = 0;
+
+    if (candidate.sameSetAhead > 0 && candidate.setName) {
+      penalty += Math.min(0.06, candidate.sameSetAhead * 0.016);
+    }
+
+    if (stats.sameSetStreak > 0 && candidate.setName) {
+      penalty += Math.min(0.14, stats.sameSetStreak * 0.026);
+    }
+
+    if (stats.recentSetHits > 0 && candidate.setName) {
+      penalty += Math.min(0.08, stats.recentSetHits * 0.012);
+    }
+
+    if (stats.recentStickerHits > 0) {
+      penalty += Math.min(0.18, stats.recentStickerHits * 0.08);
+      if (stats.latestStickerAgeMs !== null && stats.latestStickerAgeMs < SEARCH_STICKER_DEDUPE_WINDOW_MS) {
+        penalty += 0.12;
+      }
+    }
+
+    return { penalty, recentStats: stats };
+  }
+
+  function computeMetadataAdjustment(candidate, embeddedPlan) {
+    const replyText = embeddedPlan.intent.replyText || '';
+    let bonus = 0;
+    let penalty = 0;
+
+    if (candidate.emoji && replyText.includes(candidate.emoji)) {
+      bonus += 0.018;
+    }
+
+    if (candidate.setName && embeddedPlan.intent.forbid.some((text) => candidate.setName.includes(text))) {
+      penalty += 0.12;
+    }
+
+    if (candidate.emoji && embeddedPlan.intent.forbid.some((text) => text.includes(candidate.emoji))) {
+      penalty += 0.08;
+    }
+
+    return { bonus, penalty };
+  }
+
+  function computeSemanticScore(candidate, embeddedPlan) {
+    const reply = scoreWithPhrases(candidate, embeddedPlan.phrases, ['reply', 'tail']);
+    const emotion = scoreWithPhrases(candidate, embeddedPlan.phrases, ['emotion']);
+    const act = scoreWithPhrases(candidate, embeddedPlan.phrases, ['act']);
+    const context = scoreWithPhrases(candidate, embeddedPlan.phrases, ['context']);
+    const summary = scoreWithPhrases(candidate, embeddedPlan.phrases, ['summary']);
+    const forbid = scoreWithPhrases(candidate, embeddedPlan.phrases, ['forbid']);
+
+    const components = [];
+
+    if (Number.isFinite(reply.score)) components.push({ key: 'reply', value: reply.score, weight: 0.44 });
+    if (Number.isFinite(emotion.score)) components.push({ key: 'emotion', value: emotion.score, weight: 0.2 });
+    if (Number.isFinite(act.score)) components.push({ key: 'act', value: act.score, weight: 0.14 });
+    if (Number.isFinite(context.score)) components.push({ key: 'context', value: context.score, weight: 0.1 });
+    if (Number.isFinite(summary.score)) components.push({ key: 'summary', value: summary.score, weight: components.length > 0 ? 0.12 : 1.0 });
+
+    const totalWeight = components.reduce((sum, item) => sum + item.weight, 0) || 1;
+    const semanticScore = components.reduce((sum, item) => sum + (item.value * item.weight), 0) / totalWeight;
+    const forbidPenalty = Number.isFinite(forbid.score) ? Math.max(0, forbid.score) * 0.28 : 0;
+
+    return {
+      semanticScore,
+      componentScores: {
+        reply: Number.isFinite(reply.score) ? reply.score : null,
+        emotion: Number.isFinite(emotion.score) ? emotion.score : null,
+        act: Number.isFinite(act.score) ? act.score : null,
+        context: Number.isFinite(context.score) ? context.score : null,
+        summary: Number.isFinite(summary.score) ? summary.score : null,
+        forbid: Number.isFinite(forbid.score) ? forbid.score : null,
+      },
+      matchedTexts: uniqueTexts([
+        reply.matchedText,
+        emotion.matchedText,
+        act.matchedText,
+        context.matchedText,
+        summary.matchedText,
+      ]),
+      forbidPenalty,
+    };
+  }
+
+  function rerankCandidatePool(candidates, embeddedPlan, recentSelections) {
+    return candidates.map((candidate) => {
+      const semantic = computeSemanticScore(candidate, embeddedPlan);
+      const repeatAdjustment = computeRepeatPenalty(candidate, recentSelections);
+      const metadataAdjustment = computeMetadataAdjustment(candidate, embeddedPlan);
+      const bonus = metadataAdjustment.bonus;
+      const penalty = repeatAdjustment.penalty + metadataAdjustment.penalty + semantic.forbidPenalty;
+
+      return {
+        ...candidate,
+        semanticScore: semantic.semanticScore,
+        finalScore: semantic.semanticScore + bonus - penalty,
+        componentScores: semantic.componentScores,
+        matchedIntentTexts: semantic.matchedTexts,
+        bonus,
+        penalty,
+        recentStats: repeatAdjustment.recentStats,
+      };
+    }).sort((a, b) => {
+      if (b.finalScore !== a.finalScore) return b.finalScore - a.finalScore;
+      return b.baseScore - a.baseScore;
+    });
+  }
+
+  function isStickerFriendlyReply(intent) {
+    if (!intent.replyText) return true;
+    const text = intent.replyText;
+    if (text.length > 240) return false;
+    if ((text.match(/\n/g) || []).length >= 5) return false;
+    if (/```/.test(text)) return false;
+    if (/https?:\/\//i.test(text)) return false;
+    if (/^\s*[-*]\s/m.test(text) || /^\s*\d+\.\s/m.test(text)) return false;
+    return true;
+  }
+
+  function estimateExpressionNeed(intent) {
+    let score = 0;
+    if (intent.emotions.length > 0) score += 0.8;
+    if (intent.acts.length > 0) score += 0.55;
+    if (intent.contexts.length > 0) score += 0.2;
+    if (intent.intensity === 'low') score += 0.12;
+    if (intent.intensity === 'medium') score += 0.22;
+    if (intent.intensity === 'high') score += 0.35;
+    if (intent.intensity === 'max') score += 0.45;
+    if (intent.replyText && intent.replyText.length <= 28) score += 0.12;
+    if (/[！!？?~～哈哈嘿呀哇呜啦欸耶]/.test(intent.replyText || '')) score += 0.2;
+    if (/(抱抱|哭哭|笑死|好耶|呜呜|欸嘿|嘿嘿|拜托|求求|气死|离谱|无语|谢谢啦|辛苦啦)/.test(intent.replyText || '')) score += 0.16;
+    return clamp(score / 1.6, 0, 1);
+  }
+
+  function estimateCandidateConfidence(topCandidate, secondCandidate) {
+    if (!topCandidate) return 0;
+    const baseConfidence = clamp((topCandidate.finalScore - 0.12) / 0.32, 0, 1);
+    const margin = topCandidate.finalScore - Number(secondCandidate?.finalScore || 0);
+    const marginConfidence = clamp((margin - 0.004) / 0.045, 0, 1);
+    const penaltyConfidence = clamp(1 - (topCandidate.penalty / 0.34), 0, 1);
+    return clamp((baseConfidence * 0.55) + (marginConfidence * 0.25) + (penaltyConfidence * 0.2), 0, 1);
+  }
+
+  function decideStickerSend(embeddedPlan, reranked) {
+    const intent = embeddedPlan.intent;
+    const topCandidate = reranked[0] || null;
+    const secondCandidate = reranked[1] || null;
+
+    if (!topCandidate) {
+      return {
+        shouldSend: false,
+        confidence: 0,
+        reason: 'no-candidate',
+      };
+    }
+
+    if (intent.skipRequested && !intent.forceSend) {
+      return {
+        shouldSend: false,
+        confidence: 0,
+        reason: 'explicit-skip',
+      };
+    }
+
+    if (!isStickerFriendlyReply(intent) && !intent.forceSend) {
+      return {
+        shouldSend: false,
+        confidence: 0.1,
+        reason: 'reply-format-not-suitable',
+      };
+    }
+
+    const confidence = estimateCandidateConfidence(topCandidate, secondCandidate);
+    const expressionNeed = estimateExpressionNeed(intent);
+    const combinedScore = clamp((confidence * 0.7) + (expressionNeed * 0.3), 0, 1);
+
+    if (intent.forceSend) {
+      return {
+        shouldSend: confidence >= 0.18,
+        confidence,
+        reason: confidence >= 0.18 ? 'forced-send' : 'forced-but-low-confidence',
+      };
+    }
+
+    if (intent.legacyMode) {
+      return {
+        shouldSend: true,
+        confidence,
+        reason: 'legacy-query',
+      };
+    }
+
+    if (intent.explicitShouldSend === true) {
+      return {
+        shouldSend: confidence >= 0.24,
+        confidence,
+        reason: confidence >= 0.24 ? 'explicit-send' : 'explicit-send-low-confidence',
+      };
+    }
+
+    if (combinedScore < 0.38) {
+      return {
+        shouldSend: false,
+        confidence,
+        reason: 'low-confidence',
+      };
+    }
+
+    if (expressionNeed < 0.18 && confidence < 0.52) {
+      return {
+        shouldSend: false,
+        confidence,
+        reason: 'text-not-expressive-enough',
+      };
+    }
+
+    return {
+      shouldSend: true,
+      confidence,
+      reason: 'intent-aligned',
+    };
+  }
+
+  async function searchSticker(rawInput) {
+    const embeddedPlan = await embedIntentPlan(buildIntentPlan(rawInput));
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      loadSearchCache(attempt > 0);
+      if (searchCache.length === 0) throw new Error('Sticker index is empty');
+
+      const recalled = searchCache
+        .map((item) => ({
+          ...item,
+          baseScore: scoreWithPhrases(item, embeddedPlan.phrases, ['reply', 'tail', 'emotion', 'act', 'context', 'summary']).score,
+        }))
+        .sort((a, b) => b.baseScore - a.baseScore)
+        .slice(0, SEARCH_RECALL_LIMIT);
+
+      if (recalled.length === 0) throw new Error('No sticker candidates found');
+
+      const reranked = rerankCandidatePool(
+        annotateTopCandidates(recalled),
+        embeddedPlan,
+        listRecentSelections(),
+      );
+
+      const decision = decideStickerSend(embeddedPlan, reranked);
+      const topCandidate = reranked[0] || null;
+
+      if (topCandidate && hasIndexedStickerRow(topCandidate.fileUniqueId, topCandidate.fileId)) {
+        return {
+          shouldSend: decision.shouldSend,
+          confidence: decision.confidence,
+          reason: decision.reason,
+          sticker: decision.shouldSend ? {
+            fileId: topCandidate.fileId,
+            fileUniqueId: topCandidate.fileUniqueId,
+            setName: topCandidate.setName,
+            score: topCandidate.finalScore,
+            baseScore: topCandidate.baseScore,
+            semanticScore: topCandidate.semanticScore,
+            penalty: topCandidate.penalty,
+            bonus: topCandidate.bonus,
+            source: attempt > 0
+              ? `embedding2-intent-topk-rerank-refreshed/${embeddedPlan.mode}`
+              : `embedding2-intent-topk-rerank/${embeddedPlan.mode}`,
+            matchedIntentText: topCandidate.matchedIntentTexts[0] || embeddedPlan.intentSummary,
+            componentScores: topCandidate.componentScores,
+          } : null,
+          topCandidate: topCandidate ? {
+            fileId: topCandidate.fileId,
+            fileUniqueId: topCandidate.fileUniqueId,
+            setName: topCandidate.setName,
+            score: topCandidate.finalScore,
+            baseScore: topCandidate.baseScore,
+            semanticScore: topCandidate.semanticScore,
+            penalty: topCandidate.penalty,
+            bonus: topCandidate.bonus,
+            matchedIntentTexts: topCandidate.matchedIntentTexts,
+            componentScores: topCandidate.componentScores,
+          } : null,
+          runnerUp: reranked[1] ? {
+            fileId: reranked[1].fileId,
+            fileUniqueId: reranked[1].fileUniqueId,
+            setName: reranked[1].setName,
+            score: reranked[1].finalScore,
+          } : null,
+          intentSummary: embeddedPlan.intentSummary,
+          plan: embeddedPlan,
+        };
+      }
+
+      api.logger.warn(`[Stickers] Search candidates for "${embeddedPlan.rawInput}" were stale after rerank; invalidating cache and retrying.`);
+      invalidateSearchCache();
+    }
+
+    throw new Error('Top sticker candidates became stale after cache refresh');
   }
 
   function normalizeSetName(value) {
@@ -564,13 +1445,18 @@ module.exports = function registerTelegramStickersBrain(api) {
     }
   }
 
-  function queueSetOnce(setName, reason = 'manual') {
-    if (!setName) return false;
+  async function queueSetOnce(setName, reason = 'manual') {
+    if (!setName) return { queued: false, reason: 'empty' };
+
+    if (hasCompletedSetSync(setName) || await bootstrapCompletedSetSync(setName)) {
+      api.logger.info(`[Stickers] Skipping already-synced set ${setName} (${reason})`);
+      return { queued: false, reason: 'already-synced' };
+    }
 
     const now = Date.now();
     const lastQueuedAt = recentQueuedSets.get(setName) || 0;
-    if (queuedSets.has(setName) || (now - lastQueuedAt) < 10 * 60 * 1000) {
-      return false;
+    if (queuedSets.has(setName) || (now - lastQueuedAt) < RECENT_QUEUE_TTL_MS) {
+      return { queued: false, reason: 'already-queued' };
     }
 
     recentQueuedSets.set(setName, now);
@@ -580,10 +1466,58 @@ module.exports = function registerTelegramStickersBrain(api) {
     processSyncQueue().catch((e) => {
       api.logger.error(`[Stickers] Queue processing crashed: ${e.message}`);
     });
-    return true;
+    return { queued: true, reason: 'queued' };
+  }
+
+  function buildToolResultText(result) {
+    const payload = {
+      should_send: result.shouldSend,
+      confidence: Number((result.confidence || 0).toFixed(4)),
+      reason: result.reason,
+      sticker_id: result.sticker?.fileId || undefined,
+      set_name: result.sticker?.setName || result.topCandidate?.setName || undefined,
+      matched_intent: result.sticker?.matchedIntentText || result.intentSummary,
+      source: result.sticker?.source || undefined,
+      score: typeof result.sticker?.score === 'number' ? Number(result.sticker.score.toFixed(4)) : undefined,
+    };
+
+    if (result.topCandidate?.componentScores) {
+      payload.component_scores = Object.fromEntries(
+        Object.entries(result.topCandidate.componentScores)
+          .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
+          .map(([key, value]) => [key, Number(value.toFixed(4))])
+      );
+    }
+
+    return JSON.stringify(payload);
+  }
+
+  function buildPromptGuidance() {
+    return [
+      'Telegram 贴纸表达工作流（tg-stickers-chat）：',
+      '- 贴纸搜索只是底层实现细节。先想清楚你真正要发送的最终文字，再决定是否需要贴纸来加强情绪表达。',
+      '- 不是每条消息都要贴纸。长篇解释、代码、链接、表格、严肃通知、低置信度场景，都可以只发文字。',
+      '- 适合贴纸时，优先把最终回复文字和表达意图一起传给 `select_sticker_for_reply`。参数要贴近真实表达，例如：{"replyText":"好耶终于搞定啦","emotion":"开心 解脱","act":"欢呼","intensity":"medium","context":"轻松收尾","forbid":["阴阳怪气","攻击性太强"]}。',
+      '- 如果当前会话里没有 `select_sticker_for_reply`，就调用 `search_sticker_by_emotion`，并把同样的 JSON 字符串放进 query。不要向用户反问“搜什么关键词”。',
+      '- 如果工具返回 should_send=false、没有 sticker_id，或者你自己也觉得不合适，就只发文字。',
+      '- Telegram 闲聊里，能自然地“文字 + 贴纸”就优先一起发；但前提是贴纸真的更贴切。',
+    ].join('\n');
   }
 
   if (api.on) {
+    api.on('before_prompt_build', (event) => {
+      try {
+        const messages = Array.isArray(event?.messages) ? event.messages : [];
+        const lastMessage = messages[messages.length - 1];
+        const channel = lastMessage?.metadata?.channel || lastMessage?.metadata?.originatingChannel || lastMessage?.channel;
+        if (channel && channel !== 'telegram') return undefined;
+      } catch (_) {}
+
+      return {
+        prependSystemContext: buildPromptGuidance(),
+      };
+    });
+
     api.on('message_received', async (event) => {
       const channel = event.metadata?.channel || event.metadata?.originatingChannel;
       if (channel !== 'telegram') return;
@@ -603,7 +1537,7 @@ module.exports = function registerTelegramStickersBrain(api) {
         api.logger.warn(`[Stickers] Failed to capture baseline sticker cache: ${e.message}`);
       }
 
-      setTimeout(() => {
+      setTimeout(async () => {
         try {
           if (!senderId) return;
           const cache = readCoreCache();
@@ -624,16 +1558,38 @@ module.exports = function registerTelegramStickersBrain(api) {
           }
 
           if (!matchedSticker?.setName) {
-            api.logger.warn(`[Stickers] Could not confidently resolve sticker set for sender ${senderId}; skipping auto-sync to avoid false positives.`);
+            api.logger.warn('[Stickers] Could not confidently resolve sticker set from cache; skipping auto-sync to avoid false positives.');
             return;
           }
 
-          queueSetOnce(matchedSticker.setName, `auto-detect sender=${senderId} sticker=${matchedSticker.fileUniqueId || 'unknown'}`);
+          await queueSetOnce(matchedSticker.setName, `auto-detect sender=${senderId} sticker=${matchedSticker.fileUniqueId || 'unknown'}`);
         } catch (e) {
           api.logger.error(`[Stickers] Failed to detect sticker set from cache: ${e.message}`);
         }
       }, 2500);
     });
+  }
+
+  async function executeSelectSticker(rawInput) {
+    const startedAt = Date.now();
+    const queryText = normalizeWhitespace(rawInput);
+    api.logger.info(`[Stickers] Intent search for: "${queryText}"`);
+
+    try {
+      const result = await searchSticker(queryText);
+      if (result.shouldSend && result.sticker) {
+        rememberSearchSelection(result.sticker, result.intentSummary);
+      }
+      api.logger.info(
+        `[Stickers] Intent search for "${queryText}" took ${Date.now() - startedAt}ms `
+        + `(shouldSend=${result.shouldSend}, confidence=${result.confidence.toFixed(3)}, reason=${result.reason}, `
+        + `topScore=${result.topCandidate?.score?.toFixed?.(4) || 'n/a'})`
+      );
+      return { content: [{ type: 'text', text: buildToolResultText(result) }] };
+    } catch (e) {
+      api.logger.error(`[Stickers] Search error: ${e.message}`);
+      return { content: [{ type: 'text', text: `搜索失败: ${e.message}` }] };
+    }
   }
 
   api.registerTool({
@@ -657,15 +1613,18 @@ module.exports = function registerTelegramStickersBrain(api) {
           return { content: [{ type: 'text', text: '无法从你提供的参数中提取合集名称，请检查格式。' }] };
         }
 
-        const queued = queueSetOnce(targetSetName, 'manual-tool');
-        if (!queued) {
+        const queued = await queueSetOnce(targetSetName, 'manual-tool');
+        if (!queued.queued) {
+          if (queued.reason === 'already-synced') {
+            return { content: [{ type: 'text', text: `表情包合集 ${targetSetName} 之前已经完整同步过了，这次不会重复同步，避免浪费资源。` }] };
+          }
           return { content: [{ type: 'text', text: `表情包合集 ${targetSetName} 已经在同步队列里了。` }] };
         }
 
         return {
           content: [{
             type: 'text',
-            text: `好的，我已经把合集 ${targetSetName} 加入同步队列了。这一版只会用 Gemini Embedding 2 建索引，并在本地做向量相似度搜索。`
+            text: `好的，我已经把合集 ${targetSetName} 加入同步队列了。同步期会继续使用 Gemini Embedding 2 建索引，聊天时只做本地轻量检索。`
           }]
         };
       } catch (e) {
@@ -681,48 +1640,90 @@ module.exports = function registerTelegramStickersBrain(api) {
     parameters: { type: 'object', properties: {} },
     async execute() {
       const indexedCount = getIndexedStickerCount();
+      const completedSetCount = getCompletedSetCount();
       const queuedCount = syncQueue.length + (syncRunning ? 1 : 0);
       const autoCollectText = getAutoCollectEnabled() ? '开启' : '关闭';
       return {
         content: [{
           type: 'text',
-          text: `当前语义索引中共有 ${indexedCount} 张表情包，当前同步队列中有 ${queuedCount} 个合集，自动收集目前为${autoCollectText}。`
+          text: `当前语义索引中共有 ${indexedCount} 张表情包，已完整同步 ${completedSetCount} 个合集，当前同步队列中有 ${queuedCount} 个合集，自动收集目前为${autoCollectText}。`
         }]
       };
     }
   });
 
   api.registerTool({
+    name: 'select_sticker_for_reply',
+    emoji: '🎭',
+    description: '根据最终回复文字和表达意图，为 Telegram 聊天选择更贴合情绪的贴纸。支持 should-send / skip 逻辑，不合适时会明确返回只发文字。',
+    parameters: {
+      type: 'object',
+      properties: {
+        replyText: {
+          type: 'string',
+          description: '你真正准备发出去的最终文字'
+        },
+        emotion: {
+          anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+          description: '想表达的情绪，例如 开心、委屈、无奈、得意'
+        },
+        act: {
+          anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+          description: '贴纸中的动作/姿态，例如 欢呼、瘫倒、抱抱、翻白眼'
+        },
+        intensity: {
+          anyOf: [{ type: 'string' }, { type: 'number' }],
+          description: '强度，可传 low/medium/high/max 或 0-1 数字'
+        },
+        context: {
+          anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+          description: '语境或风格，例如 轻松收尾、撒娇、安慰、嘴硬'
+        },
+        query: {
+          type: 'string',
+          description: '可选补充提示词；一般只在 replyText 之外补几词，不要替代 replyText'
+        },
+        forbid: {
+          anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+          description: '明确避免的风格或情绪，例如 阴阳怪气、太攻击性'
+        },
+        shouldSend: {
+          type: 'boolean',
+          description: '可选显式偏好：true=尽量发，false=本轮不发'
+        },
+        force: {
+          type: 'boolean',
+          description: '即使置信度一般也尽量给一个结果'
+        }
+      },
+      required: ['replyText']
+    },
+    async execute(id, params) {
+      return executeSelectSticker(JSON.stringify(params || {}));
+    }
+  });
+
+  api.registerTool({
     name: 'search_sticker_by_emotion',
     emoji: '🔎',
-    description: '通过语义（情感、动作、特征）搜索表情包库，并返回匹配的 sticker_id，用于随后通过 message(action=sticker) 发送。\n构建 query 时，请使用具体的情绪、动作、视觉特征的中文词汇组合（如 开心 笑着 跑 或 无奈 叹气 摆烂）。',
+    description: '通过语义搜索 Telegram 贴纸。兼容传统情绪关键词，也兼容直接传最终回复文本；更推荐传 JSON 字符串，把 replyText / emotion / act / intensity / forbid 一起给进去。',
     parameters: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: '表情包的语义搜索词（例如：开心 笑着 跑）'
+          description: '传统关键词，或 JSON 字符串，例如 {"replyText":"好耶终于下班啦","emotion":"开心 解脱","act":"欢呼"}'
         }
       },
       required: ['query']
     },
     async execute(id, params) {
-      const startedAt = Date.now();
-      const queryText = String(params.query || '').trim();
-      api.logger.info(`[Stickers] Semantic search for: "${queryText}"`);
-
-      try {
-        const result = await searchSticker(queryText);
-        api.logger.info(`[Stickers] Search for "${queryText}" took ${Date.now() - startedAt}ms via ${result.source} (score=${result.score.toFixed(4)})`);
-        return { content: [{ type: 'text', text: `{"sticker_id": "${result.fileId}"}` }] };
-      } catch (e) {
-        api.logger.error(`[Stickers] Search error: ${e.message}`);
-        return { content: [{ type: 'text', text: `搜索失败: ${e.message}` }] };
-      }
+      return executeSelectSticker(params.query);
     }
   });
 
   ensureIndexDb();
   ensureCoreCache();
+  importLegacySelectionStateIfNeeded();
   loadSearchCache();
 };

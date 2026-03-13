@@ -59,26 +59,38 @@ openclaw gateway restart
 
 ## 实现原理
 
-整个流程只有一条主路径：
+这一版把主流程从“给几个情绪关键词搜图”重构成了：
 
 1. 同步一个 Telegram 表情包合集
 2. 下载每张贴纸文件
-3. 如果是静态图就直接用原图；如果是动图或视频，就抽一帧预览图
-4. 用 **Gemini Embedding 2** 给贴纸生成向量
-5. 把向量存到本地 **SQLite**
-6. 聊天时，agent 可以把语义查询转成向量
-7. 在本地内存里做相似度匹配
-8. 找到合适的 Telegram `sticker_id` 后发出去
+3. 如果是静态图就直接用原图；如果是动图或视频，就抽一帧 PNG 预览图
+4. 用 **Gemini Embedding 2** 给贴纸生成多模态向量
+5. 把向量存到本地 **SQLite**，聊天检索时直接加载到内存
+6. 聊天时，agent 先决定自己真正要发送的最终文字
+7. 再把 `replyText / emotion / act / intensity / context / forbid` 这样的表达意图喂给检索器
+8. 本地做 **top-k 召回 + 轻量重排**，重排目标是“情绪、动作、强度、语境是否贴合”
+9. 如果置信度不足或场景不适合，就直接 skip，只发文字
+10. 只有在判断“这张贴纸真的更会说话”时才返回 `sticker_id`
 
-如果打开了 `autoCollect`，聊天里出现新的表情包合集时，插件会自动把它加入处理队列；但索引和搜索核心逻辑不会变化。
+如果打开了 `autoCollect`，聊天里出现新的表情包合集时，插件会自动把它加入处理队列；同步期仍然保留原来的自动收集、同 set 去重、WEBP/GIF/TGS/WEBM -> PNG 预览、Gemini Embedding 2、SQLite 索引这条链路。
 
-和 OpenClaw 原生那种主要基于缓存 description / emoji / setName 的文本匹配不同，这个插件把“选哪张贴纸”升级成了语义检索问题，因此更适合做贴近聊天语境的主动发贴纸。
+### 为什么没有额外给每张贴纸预先打 emotion/act 标签？
 
-插件会向 OpenClaw 提供这 3 个工具：
+这次重构刻意**没有**再加一套同步期的外部标签生成流程。原因很简单：
+
+- 现在的多模态 embedding 已经把图像语义保留下来了
+- 再为每张贴纸单独跑一次标签生成，会明显增加同步成本和复杂度
+- 这些标签还会带来额外的 schema、回填、失败重试和兼容成本
+- 当前阶段，用“结构化表达意图 + embedding facet 重排”就能把效果拉上来，而且聊天期仍然保持很轻
+
+所以这版优先选择：**不加重依赖、不加重同步复杂度，先把表达意图这条主路径做干净。**
+
+插件会向 OpenClaw 提供这 4 个工具：
 
 - `sync_sticker_set_by_name`
 - `get_sticker_stats`
-- `search_sticker_by_emotion`
+- `select_sticker_for_reply`（新的主入口）
+- `search_sticker_by_emotion`（兼容旧调用，但内部也支持结构化 JSON）
 
 ---
 

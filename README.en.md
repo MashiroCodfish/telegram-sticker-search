@@ -59,26 +59,40 @@ This project is intentionally small and uses only a few pieces:
 
 ## How It Works
 
-The core path is very small:
+This refactor changes the main flow from “search stickers with mood keywords” into:
 
 1. Sync a Telegram sticker set
 2. Download sticker files
-3. Use the original image directly for static stickers, or extract a preview frame for animated/video stickers
-4. Generate vectors with **Gemini Embedding 2**
-5. Store vectors in local **SQLite**
-6. Let the agent turn its query into a vector during chat
-7. Run similarity matching locally in memory
-8. Return the best matching Telegram `sticker_id` so it can be sent in chat
+3. Use the original image directly for static stickers, or extract a PNG preview frame for animated/video stickers
+4. Generate multimodal vectors with **Gemini Embedding 2**
+5. Store vectors in local **SQLite** and keep retrieval local/in-memory during chat
+6. During chat, the agent first decides the actual final text it wants to send
+7. Then it passes structured expression intent like `replyText / emotion / act / intensity / context / forbid`
+8. The plugin runs **top-k recall + lightweight reranking**, optimized for emotional fit, action fit, intensity, and context fit
+9. If confidence is low or the moment is not sticker-friendly, it explicitly skips and lets the agent send text only
+10. Only when the sticker really improves expression does it return a `sticker_id`
 
-If `autoCollect` is enabled, newly seen sticker sets in chats can be queued automatically. The indexing and search core stays the same.
+If `autoCollect` is enabled, newly seen sticker sets in chats can still be queued automatically. The original must-keep path remains intact: auto sync, persistent same-set dedupe, WEBP/GIF/TGS/WEBM -> PNG preview conversion, Gemini Embedding 2, SQLite indexing, and local search.
 
-Unlike OpenClaw's native cached text matching over description / emoji / setName, this plugin turns sticker selection into a semantic retrieval problem, which makes proactive sticker use in chat much more context-aware.
+### Why not add per-sticker emotion/action tags during sync?
 
-The plugin exposes these three tools to OpenClaw:
+This version intentionally does **not** add a second external tagging pipeline for every sticker.
+
+Why:
+
+- the existing multimodal embeddings already preserve most visual semantics
+- extra per-sticker labeling would make sync slower and more failure-prone
+- it would add more schema/migration complexity for limited practical gain right now
+- structured intent + facet-aware reranking already improves emotional fit while keeping chat-time latency low
+
+So this refactor chooses the simpler path on purpose: **keep sync light enough, keep chat-time retrieval very light, and make intent the first-class input.**
+
+The plugin now exposes these four tools to OpenClaw:
 
 - `sync_sticker_set_by_name`
 - `get_sticker_stats`
-- `search_sticker_by_emotion`
+- `select_sticker_for_reply` (new primary entry point)
+- `search_sticker_by_emotion` (legacy-compatible, but now also accepts structured JSON)
 
 ---
 

@@ -1494,13 +1494,42 @@ module.exports = function registerTelegramStickersBrain(api) {
 
   function buildPromptGuidance() {
     return [
-      'Telegram 贴纸表达工作流（tg-stickers-chat）：',
-      '- 贴纸搜索只是底层实现细节。先想清楚你真正要发送的最终文字，再决定是否需要贴纸来加强情绪表达。',
-      '- 不是每条消息都要贴纸。长篇解释、代码、链接、表格、严肃通知、低置信度场景，都可以只发文字。',
-      '- 适合贴纸时，优先把最终回复文字和表达意图一起传给 `select_sticker_for_reply`。参数要贴近真实表达，例如：{"replyText":"好耶终于搞定啦","emotion":"开心 解脱","act":"欢呼","intensity":"medium","context":"轻松收尾","forbid":["阴阳怪气","攻击性太强"]}。',
-      '- 如果当前会话里没有 `select_sticker_for_reply`，就调用 `search_sticker_by_emotion`，并把同样的 JSON 字符串放进 query。不要向用户反问“搜什么关键词”。',
-      '- 如果工具返回 should_send=false、没有 sticker_id，或者你自己也觉得不合适，就只发文字。',
-      '- Telegram 闲聊里，能自然地“文字 + 贴纸”就优先一起发；但前提是贴纸真的更贴切。',
+      'Telegram 贴纸 tool use（tg-stickers-chat）',
+      '',
+      '步骤',
+      '需要贴纸时：',
+      '1. 先确定最终文字 `replyText`。',
+      '2. 单独调用 `select_sticker_for_reply`。',
+      '3. 等结果返回。',
+      '4. 如果 `should_send=true` 且有 `sticker_id`：调用 `message(action="sticker", stickerId=[sticker_id])` 发送贴纸。注意：`stickerId` 必须是数组。',
+      '5. 再发送文字：`message(action="send", message=replyText)`。',
+      '6. 最终输出 `NO_REPLY`。',
+      '不需要贴纸时：',
+      '- 要么直接自然语言回复。',
+      '- 要么调用 `message(action="send", message=replyText)`，然后最终输出 `NO_REPLY`。',
+      '- 不要两种都做。',
+      '',
+      '正确范例',
+      '- 需要贴纸：先 `select_sticker_for_reply({...})`，等结果，再 `message(action="sticker", stickerId=[result.sticker_id])`，再 `message(action="send", message=replyText)`，最后 `NO_REPLY`。',
+      '- 不需要贴纸：直接自然语言回复；或者 `message(action="send", message=replyText)` 后 `NO_REPLY`。',
+      '',
+      '错误范例',
+      '- `parallel(select_sticker_for_reply(...), message(action="sticker", ...), message(action="send", ...))`',
+      '- `message(action="send", message="CAACAg...")`',
+      '- `message(action="sticker", stickerId="CAACAg...")`',
+      '- 先发旧 `stickerId`，再等选择结果。',
+      '- 在 `message(action="send")` 之后又自然语言重复同一段话。',
+      '- 贴纸失败后，把已经成功发过的文字再重发一次。',
+      '',
+      '注意事项',
+      '- `select_sticker_for_reply` 只负责选贴纸，不负责发送。',
+      '- `message(action="sticker")` 才是发送贴纸。',
+      '- `stickerId` 必须是数组：`["CAACAg..."]`。',
+      '- 整条链路必须严格串行，不要并行。',
+      '- 如果 `should_send=false`、没有 `sticker_id`、或贴纸不贴切，就只发文字。',
+      '- 如果当前没有 `select_sticker_for_reply`，就调用 `search_sticker_by_emotion`，把包含 `replyText` / `emotion` / `act` / `intensity` / `context` / `forbid` 的 JSON 字符串放进 `query`。不要向用户追问搜索关键词。',
+      '- 只要用了 `message(action="send")` 发用户可见文字，最终就必须是 `NO_REPLY`。',
+      '- 失败补救时，只补失败的那一步；不要重发已经成功的文字。',
     ].join('\n');
   }
 
@@ -1684,8 +1713,8 @@ module.exports = function registerTelegramStickersBrain(api) {
           description: '可选补充提示词；一般只在 replyText 之外补几词，不要替代 replyText'
         },
         forbid: {
-          anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-          description: '明确避免的风格或情绪，例如 阴阳怪气、太攻击性'
+          type: 'string',
+          description: '明确避免的风格或情绪，建议直接传一个字符串，例如 "阴阳怪气,攻击性太强"'
         },
         shouldSend: {
           type: 'boolean',

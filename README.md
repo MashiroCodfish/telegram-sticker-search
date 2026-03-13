@@ -55,6 +55,8 @@ openclaw gateway restart
 - `select_sticker_for_reply`
 - `search_sticker_by_emotion`
 
+推荐聊天主流程：先想好最终回复文字 → 判断是否需要贴纸 → 如需要则调用 `select_sticker_for_reply` → 先发贴纸 → 再发文字。
+
 ## 配置
 
 配置路径：

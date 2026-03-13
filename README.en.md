@@ -55,6 +55,8 @@ openclaw gateway restart
 - `select_sticker_for_reply`
 - `search_sticker_by_emotion`
 
+Recommended chat flow: decide the final reply text first → decide whether a sticker is needed → if needed, call `select_sticker_for_reply` → send the sticker first → send the text after that.
+
 ## Configuration
 
 Config path:

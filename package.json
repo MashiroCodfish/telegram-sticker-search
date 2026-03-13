@@ -1,6 +1,6 @@
 {
   "name": "tg-stickers-chat",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "OpenClaw Telegram sticker chat enhancement plugin built around intent-driven sticker selection, Gemini Embedding 2, and local vector similarity search.",
   "main": "index.js",
   "openclaw": {
